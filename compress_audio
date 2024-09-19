@@ -75,17 +75,20 @@ generate_output_filename() {
 get_file_size() {
   local file="$1"
   if [[ -f "$file" ]]; then
-    if stat -f%z "$file" >/dev/null 2>&1; then
-      # BSD stat (macOS)
-      stat -f%z "$file"
+    local size
+    if size=$(stat -f%z "$file" 2>/dev/null); then
+      echo "$size"
+    elif size=$(stat --printf="%s" "$file" 2>/dev/null); then
+      echo "$size"
     else
-      # GNU stat (Linux)
-      stat --printf="%s" "$file"
+      size=$(wc -c < "$file" | tr -d ' ')
+      echo "$size"
     fi
   else
     echo 0
   fi
 }
+
 
 # Function to process each MP3 file
 process_audio_file() {
@@ -310,14 +313,6 @@ main() {
     fi
   fi
 
-  # Check for required tools
-  for cmd in ffmpeg; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-      echo "Error: $cmd is not installed."
-      exit 1
-    fi
-  done
-
   # Validate silence removal option
   case "$SILENCE_OPTION" in
     none|start|end|both|all)
@@ -328,10 +323,17 @@ main() {
       ;;
   esac
 
+    # Ensure required tools
+  for cmd in ffmpeg; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "Error: $cmd is not installed."
+      exit 1
+    fi
+  done
+
   # Export necessary variables and functions for subshells
   export VBR_QUALITY SILENCE_THRESHOLD SILENCE_OPTION VERBOSE INPUT_FOLDER OUTPUT_FOLDER FFMPEG_THREADS ERROR_LOG
-  export FAILED_FILES_LOG LOG_FILE
-  export PROGRESS_FILE
+  export FAILED_FILES_LOG LOG_FILE PROGRESS_FILE
   export -f generate_output_filename process_audio_file log_message log_error get_file_size process_file
 
   # Capture function definitions for use in subshells
@@ -368,9 +370,13 @@ main() {
   # Aggregate sizes
   if [[ -f "$SIZES_FILE" ]]; then
     while read -r original_size compressed_size; do
-      TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + original_size))
-      TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + compressed_size))
-      TOTAL_FILES_COUNT=$((TOTAL_FILES_COUNT + 1))
+      if [[ "$original_size" =~ ^[0-9]+$ && "$compressed_size" =~ ^[0-9]+$ ]]; then
+        TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + original_size))
+        TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + compressed_size))
+        TOTAL_FILES_COUNT=$((TOTAL_FILES_COUNT + 1))
+      else
+        log_error "Invalid size data: original_size=$original_size, compressed_size=$compressed_size"
+      fi
     done < "$SIZES_FILE"
     # Remove temporary file
     rm "$SIZES_FILE"
