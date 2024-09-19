@@ -1,0 +1,412 @@
+#!/bin/bash
+
+# MP3 Compression Script
+# This script recursively compresses all MP3 files in the specified input folder and saves them
+# in the output folder with the same file names and structure. It uses FFmpeg to apply Variable Bitrate (VBR) compression.
+# Optionally, it can remove silence from the audio files based on the specified silence removal option.
+
+# Usage: ./compress_audio.sh -i <input_folder> -o <output_folder> [-q <quality>] [-t <threshold>] [-s <silence_option>] [-n <num_threads>] [-v]
+
+# Parameters:
+#   -i <input_folder>        The folder containing the MP3 files to compress.
+#   -o <output_folder>       The folder to save compressed audio files.
+#   -q <quality>             VBR quality level (0-9). Lower values mean higher quality. Default: 2.
+#   -t <threshold>           dB threshold to detect silence (e.g., -45dB). Default: -45dB.
+#   -s <silence_option>      Silence removal option: none, start, end, both, or all. Default: none.
+#   -n <num_threads>         Number of parallel processes to use. Default: Number of CPUs.
+#   -v                       Enable verbose logging.
+
+# Function to display the help text
+show_help() {
+  cat <<EOF
+MP3 Compression Script
+
+Usage: $0 -i <input_folder> -o <output_folder> [-q <quality>] [-t <threshold>] [-s <silence_option>] [-n <num_threads>] [-v]
+
+Description:
+This script recursively compresses all MP3 files in the specified input folder and saves them
+in the output folder with the same file names and structure. It uses FFmpeg to apply Variable Bitrate (VBR) compression.
+Optionally, it can remove silence from the audio files based on the specified silence removal option.
+
+Parameters:
+  -i <input_folder>        The folder containing the MP3 files to compress.
+  -o <output_folder>       The folder to save compressed audio files.
+  -q <quality>             VBR quality level (0-9). Lower values mean higher quality. Default: 2.
+  -t <threshold>           dB threshold to detect silence (e.g., -45dB). Default: -45dB.
+  -s <silence_option>      Silence removal option: none, start, end, both, or all. Default: none.
+  -n <num_threads>         Number of parallel processes to use. Default: Number of CPUs.
+  -v                       Enable verbose logging.
+
+EOF
+  exit 1
+}
+
+# Function to log errors
+log_error() {
+  local message="$1"
+  echo "[ERROR] $message" >> "$FAILED_FILES_LOG"
+  log_message "$message"
+}
+
+# Function to log messages
+log_message() {
+  local message="$1"
+  echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $message" >> "$LOG_FILE"
+  if [[ "$VERBOSE" == true ]]; then
+    echo "$message"
+  fi
+}
+
+# Function to generate the output filename, ensuring no conflict
+generate_output_filename() {
+  local input_file="$1"
+  local relative_path="${input_file#$INPUT_FOLDER}"
+  relative_path="${relative_path#/}"  # Remove leading slash if any
+  local output_file="$OUTPUT_FOLDER/$relative_path"
+
+  if ! mkdir -p "$(dirname "$output_file")"; then
+    log_error "Failed to create directory for $output_file"
+    exit 1
+  fi
+  echo "$output_file"
+}
+
+# Function to get file size in bytes (cross-platform)
+get_file_size() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    if stat -f%z "$file" >/dev/null 2>&1; then
+      # BSD stat (macOS)
+      stat -f%z "$file"
+    else
+      # GNU stat (Linux)
+      stat --printf="%s" "$file"
+    fi
+  else
+    echo 0
+  fi
+}
+
+# Function to process each MP3 file
+process_audio_file() {
+  local input_file="$1"
+  local output_file="$2"
+  local error_log="$3"
+
+  log_message "Processing file: $input_file"
+
+  if [[ "$input_file" == "$output_file" ]]; then
+    log_error "Input and output files are the same: $input_file"
+    return 1
+  fi
+
+  local original_size
+  original_size=$(get_file_size "$input_file")  # Get original file size
+
+  # Clear error log before processing
+  rm -f "$error_log"
+
+  # Build the audio filter based on silence removal option
+  local audio_filter=""
+  case "$SILENCE_OPTION" in
+    none)
+      audio_filter=""
+      ;;
+    start)
+      audio_filter="silenceremove=start_periods=1:start_duration=0.1:start_threshold=${SILENCE_THRESHOLD}"
+      ;;
+    end)
+      audio_filter="silenceremove=stop_periods=1:stop_duration=0.1:stop_threshold=${SILENCE_THRESHOLD}"
+      ;;
+    both|all)
+      audio_filter="silenceremove=start_periods=1:start_duration=0.1:start_threshold=${SILENCE_THRESHOLD},silenceremove=stop_periods=1:stop_duration=0.1:stop_threshold=${SILENCE_THRESHOLD}"
+      ;;
+    *)
+      log_error "Invalid silence removal option: $SILENCE_OPTION"
+      return 1
+      ;;
+  esac
+
+  if ffmpeg -y -i "$input_file" \
+    ${audio_filter:+-af "$audio_filter"} \
+    -c:a libmp3lame -q:a "$VBR_QUALITY" -threads "$FFMPEG_THREADS" \
+    -map_metadata 0 \
+    "$output_file" 2>> "$error_log"; then
+    local compressed_size
+    compressed_size=$(get_file_size "$output_file")  # Get compressed file size
+    # Output sizes for aggregation
+    echo "$original_size $compressed_size"
+
+    # Update progress
+    if [[ -n "$PROGRESS_FILE" ]]; then
+      echo "1" >> "$PROGRESS_FILE"
+    fi
+  else
+    log_error "Failed to process $input_file."
+    if [[ -f "$error_log" ]]; then
+      log_message "FFmpeg error log for $input_file:"
+      while IFS= read -r line; do
+        log_message "$line"
+      done < "$error_log"
+    fi
+    return 1
+  fi
+}
+
+# Function to calculate human-readable sizes
+convert_to_human_readable() {
+  local size="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$size"
+  else
+    # Fallback for macOS
+    if command -v awk >/dev/null 2>&1; then
+      if [[ "$size" -ge 1073741824 ]]; then
+        awk -v s="$size" 'BEGIN {printf "%.2fGiB", s/1073741824}'
+      elif [[ "$size" -ge 1048576 ]]; then
+        awk -v s="$size" 'BEGIN {printf "%.2fMiB", s/1048576}'
+      elif [[ "$size" -ge 1024 ]]; then
+        awk -v s="$size" 'BEGIN {printf "%.2fKiB", s/1024}'
+      else
+        echo "${size}B"
+      fi
+    else
+      echo "$size bytes"
+    fi
+  fi
+}
+
+# Function to process each file (used in parallel execution)
+process_file() {
+  local file="$1"
+  local sizes_file="$2"
+  local error_log="$ERROR_LOG"
+
+  local output_file
+  output_file=$(generate_output_filename "$file")
+  if [[ -n "$file" && -n "$output_file" ]]; then
+    local sizes
+    sizes=$(process_audio_file "$file" "$output_file" "$error_log")
+    if [[ $? -eq 0 ]]; then
+      # Append sizes to temporary file
+      echo "$sizes" >> "$sizes_file"
+    fi
+  else
+    log_error "Invalid file or output path: file=$file, output=$output_file"
+  fi
+}
+
+# Function to display progress
+display_progress() {
+  local total_files="$1"
+  local progress_file="$2"
+
+  while true; do
+    sleep 1
+    local processed_files
+    processed_files=$(wc -l < "$progress_file" 2>/dev/null || echo 0)
+    if [[ "$processed_files" -gt "$total_files" ]]; then
+      processed_files="$total_files"
+    fi
+    local percent
+    percent=$(( processed_files * 100 / total_files ))
+    echo -ne "Progress: $processed_files/$total_files files processed ($percent%)\r"
+    if [[ "$processed_files" -ge "$total_files" ]]; then
+      break
+    fi
+  done
+  echo
+}
+
+# Main function
+main() {
+  # Define log file names
+  FAILED_FILES_LOG="failed_files.log"
+  LOG_FILE="compress.log"
+  ERROR_LOG="error.log"
+
+  # Initialize counters
+  TOTAL_ORIGINAL_SIZE=0
+  TOTAL_COMPRESSED_SIZE=0
+  TOTAL_FILES_COUNT=0
+
+  # Start timer
+  START_TIME=$(date +%s)
+
+  # Default values
+  VBR_QUALITY=2
+  SILENCE_THRESHOLD=-45dB
+  SILENCE_OPTION="none"  # Default is no silence removal
+  VERBOSE=false
+
+  # Detect number of CPUs for parallel processing
+  if command -v sysctl >/dev/null 2>&1; then
+    NUM_CPUS=$(sysctl -n hw.ncpu)
+  elif command -v nproc >/dev/null 2>&1; then
+    NUM_CPUS=$(nproc)
+  else
+    NUM_CPUS=1
+  fi
+
+  NUM_THREADS="$NUM_CPUS"  # Default number of parallel processes
+  FFMPEG_THREADS=1         # Default ffmpeg threads per process
+
+  # Argument parsing
+  while getopts ":i:o:q:t:s:n:v" opt; do
+    case $opt in
+      i) INPUT_FOLDER="$OPTARG" ;;
+      o) OUTPUT_FOLDER="$OPTARG" ;;
+      q) VBR_QUALITY="$OPTARG" ;;
+      t) SILENCE_THRESHOLD="$OPTARG" ;;
+      s) SILENCE_OPTION="$OPTARG" ;;
+      n) NUM_THREADS="$OPTARG" ;;
+      v) VERBOSE=true ;;
+      *) show_help ;;
+    esac
+  done
+
+  # Ensure required arguments are provided
+  if [[ -z "$INPUT_FOLDER" || -z "$OUTPUT_FOLDER" ]]; then
+    show_help
+  fi
+
+  # Remove any trailing slashes from INPUT_FOLDER and OUTPUT_FOLDER
+  INPUT_FOLDER="${INPUT_FOLDER%/}"
+  OUTPUT_FOLDER="${OUTPUT_FOLDER%/}"
+
+  # Validate input parameters
+  if ! [[ "$VBR_QUALITY" =~ ^[0-9]$ ]]; then
+    log_error "Invalid VBR quality: $VBR_QUALITY. It must be an integer between 0 and 9."
+    exit 1
+  fi
+
+  if ! [[ "$SILENCE_THRESHOLD" =~ ^-?[0-9]+(\.[0-9]+)?dB$ ]]; then
+    log_error "Invalid silence threshold: $SILENCE_THRESHOLD. It must be a number followed by 'dB', e.g., -45dB."
+    exit 1
+  fi
+
+  if ! [[ "$NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    log_error "Invalid number of threads: $NUM_THREADS. It must be a positive integer."
+    exit 1
+  fi
+
+  # Ensure input and output paths are distinct
+  if [[ "$INPUT_FOLDER" == "$OUTPUT_FOLDER" ]]; then
+    log_error "Input and output folders cannot be the same."
+    exit 1
+  fi
+
+  # Ensure the input folder exists
+  if [[ ! -d "$INPUT_FOLDER" ]]; then
+    log_error "Input folder does not exist: $INPUT_FOLDER"
+    exit 1
+  fi
+
+  # Ensure the output folder exists (create if necessary)
+  if [[ ! -d "$OUTPUT_FOLDER" ]]; then
+    if ! mkdir -p "$OUTPUT_FOLDER"; then
+      log_error "Failed to create output folder: $OUTPUT_FOLDER"
+      exit 1
+    fi
+  fi
+
+  # Check for required tools
+  for cmd in ffmpeg; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "Error: $cmd is not installed."
+      exit 1
+    fi
+  done
+
+  # Validate silence removal option
+  case "$SILENCE_OPTION" in
+    none|start|end|both|all)
+      ;;
+    *)
+      log_error "Invalid silence removal option: $SILENCE_OPTION. Valid options are: none, start, end, both, all."
+      exit 1
+      ;;
+  esac
+
+  # Export necessary variables and functions for subshells
+  export VBR_QUALITY SILENCE_THRESHOLD SILENCE_OPTION VERBOSE INPUT_FOLDER OUTPUT_FOLDER FFMPEG_THREADS ERROR_LOG
+  export FAILED_FILES_LOG LOG_FILE
+  export PROGRESS_FILE
+  export -f generate_output_filename process_audio_file log_message log_error get_file_size process_file
+
+  # Capture function definitions for use in subshells
+  SCRIPT_CODE=$(declare -f generate_output_filename process_audio_file log_message log_error get_file_size process_file)
+
+  # Find total number of files to process
+  TOTAL_FILES=$(find "$INPUT_FOLDER" -type f -name "*.mp3" | wc -l | tr -d ' ')
+  if [[ "$TOTAL_FILES" -eq 0 ]]; then
+    echo "No MP3 files found in the input folder."
+    exit 0
+  fi
+
+  echo "Number of CPU cores used: $NUM_THREADS"
+  echo "Total files to process: $TOTAL_FILES"
+
+  # Temporary files to store sizes and progress
+  SIZES_FILE=$(mktemp)
+  PROGRESS_FILE=$(mktemp)
+
+  # Start the progress display in the background
+  display_progress "$TOTAL_FILES" "$PROGRESS_FILE" &
+  PROGRESS_PID=$!
+
+  # Find and process files
+  find "$INPUT_FOLDER" -type f -name "*.mp3" -print0 | \
+  xargs -0 -P "$NUM_THREADS" -I {} bash -c "$SCRIPT_CODE; process_file \"\$@\"" _ {} "$SIZES_FILE"
+
+  # Wait for all background jobs to finish
+  wait
+
+  # Remove progress display
+  rm "$PROGRESS_FILE"
+
+  # Aggregate sizes
+  if [[ -f "$SIZES_FILE" ]]; then
+    while read -r original_size compressed_size; do
+      TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + original_size))
+      TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + compressed_size))
+      TOTAL_FILES_COUNT=$((TOTAL_FILES_COUNT + 1))
+    done < "$SIZES_FILE"
+    # Remove temporary file
+    rm "$SIZES_FILE"
+  else
+    log_error "No sizes were recorded. Exiting."
+    exit 1
+  fi
+
+  # End timer
+  END_TIME=$(date +%s)
+  ELAPSED_TIME=$((END_TIME - START_TIME))
+
+  # Compression summary
+  echo "=================================="
+  echo "Compression Summary"
+  echo "=================================="
+  echo "Total files processed: $TOTAL_FILES_COUNT"
+  echo "Total original size: $(convert_to_human_readable "$TOTAL_ORIGINAL_SIZE")"
+  echo "Total compressed size: $(convert_to_human_readable "$TOTAL_COMPRESSED_SIZE")"
+  SPACE_SAVED=$((TOTAL_ORIGINAL_SIZE - TOTAL_COMPRESSED_SIZE))
+  if [ "$TOTAL_ORIGINAL_SIZE" -gt 0 ]; then
+    if command -v bc >/dev/null 2>&1; then
+      PERCENT_SAVED=$(echo "scale=2; ($SPACE_SAVED / $TOTAL_ORIGINAL_SIZE) * 100" | bc)
+    else
+      PERCENT_SAVED=$(awk -v space_saved="$SPACE_SAVED" -v total_original_size="$TOTAL_ORIGINAL_SIZE" \
+      'BEGIN {printf "%.2f", (space_saved / total_original_size) * 100}')
+    fi
+  else
+    PERCENT_SAVED=0
+  fi
+  echo "Space saved: $(convert_to_human_readable "$SPACE_SAVED") (${PERCENT_SAVED}%)"
+  echo "Total time taken: $ELAPSED_TIME seconds"
+  echo "=================================="
+}
+
+# Only execute main if the script is run directly, not sourced
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
